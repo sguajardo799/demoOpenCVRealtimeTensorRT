@@ -39,12 +39,12 @@ def overlay_mask(bgr, mask_color, alpha=0.5):
 # Preprocesado CPU simple
 # =========================
 def preprocess_bgr_cpu(frame_bgr, size=IM_SIZE):
-    mean = np.asarray(IMAGENET_MEAN, dtype=np.float32)
-    std  = np.asarray(IMAGENET_STD,  dtype=np.float32)
+    #mean = np.asarray(IMAGENET_MEAN, dtype=np.float32)
+    #std  = np.asarray(IMAGENET_STD,  dtype=np.float32)
 
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     rgb = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
-    rgb = (rgb - mean) / std
+    #rgb = (rgb - mean) / std
     chw = np.transpose(rgb, (2, 0, 1))  # (3,H,W)
     x = np.empty((1, 3, size, size), np.float32)    # contiguo
     x[0] = chw                                      # copia -> contiguo
@@ -110,7 +110,7 @@ if __name__ == "__main__":
             break
 
         # --- Preprocesa en CPU ---
-        x_host = preprocess_bgr_cpu(frame, IM_SIZE)               # (1,3,512,512) float32
+        x_host = preprocess_bgr_cpu(frame, IM_SIZE)               # (1,3,512,512) 
         y_host = np.empty(st["out_shape"], dtype=st["out_dtype"]) # buffer host salida
 
         # --- Copias y ejecución (una sola stream, sin doble buffer) ---
