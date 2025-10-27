@@ -6,22 +6,27 @@ import pycuda.autoinit
 import tensorrt as trt
 
 # =========================
-# Constantes y utilidades
+# Constantes
 # =========================
 IM_SIZE = 512
 MODEL_PLAN = "model.plan"
-
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
 def make_palette(n=256, seed=0):
     rng = np.random.RandomState(seed)
     pal = (rng.rand(n, 3) * 255).astype(np.uint8)
-    pal[0] = np.array([0, 0, 0], np.uint8)  # clase 0 → negro
+    pal[0] = np.array([0, 0, 0], np.uint8)
     return pal
 
 PALETTE = make_palette(256)
-categories = None  # reemplaza por lista COCO si quieres rotular
+categories = [
+    "background",
+    "aeroplane", "bicycle", "bird", "boat", "bottle",
+    "bus", "car", "cat", "chair", "cow",
+    "diningtable", "dog", "horse", "motorbike", "person",
+    "pottedplant", "sheep", "sofa", "train", "tvmonitor",
+]
 
 def colorize_mask(mask_uint8):
     return PALETTE[mask_uint8]
@@ -31,10 +36,9 @@ def overlay_mask(bgr, mask_color, alpha=0.5):
     return cv2.addWeighted(bgr, 1.0 - alpha, mask_resized, alpha, 0.0)
 
 # =========================
-# Preprocesado
+# Preprocesado CPU simple
 # =========================
-def preprocess_bgr_cpu(frame_bgr, size=IM_SIZE, out_nchw=None):
-    """BGR -> RGB -> resize -> normaliza (ImageNet) -> NCHW float32 en [1,3,H,W]"""
+def preprocess_bgr_cpu(frame_bgr, size=IM_SIZE):
     mean = np.asarray(IMAGENET_MEAN, dtype=np.float32)
     std  = np.asarray(IMAGENET_STD,  dtype=np.float32)
 
@@ -42,142 +46,148 @@ def preprocess_bgr_cpu(frame_bgr, size=IM_SIZE, out_nchw=None):
     rgb = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
     rgb = (rgb - mean) / std
     chw = np.transpose(rgb, (2, 0, 1))  # (3,H,W)
-
-    if out_nchw is None:
-        x = np.empty((1, 3, size, size), dtype=np.float32)
-    else:
-        x = out_nchw  # buffer pagelocked
-    x[0, ...] = chw
-    return x
+    x = np.expand_dims(chw, axis=0).astype(np.float32)  # (1,3,H,W)
+    return x  # host numpy
 
 # =========================
-# TensorRT init + buffers
+# TensorRT init (sin doble buffer)
 # =========================
-def _dims_to_tuple(dims: "trt.Dims"):
-    return tuple(int(dims[i]) for i in range(len(dims)))
+def load_engine_and_alloc(plan_path):
+    """
+    Carga un engine TensorRT desde un .plan, crea el contexto de ejecución y
+    reserva UNA vez la memoria de device para entrada y salida. Devuelve
+    los identificadores clave para ejecutar inferencia cuadro a cuadro
+    con copias simples H->D, ejecución async y D->H.
 
-def init_trt(plan_path):
+    Suposiciones:
+        - La ENTRADA del modelo es fija y coincide con el preprocesado:
+          (1, 3, IM_SIZE, IM_SIZE) en float32.
+        - La SALIDA del modelo está definida en el plan; su shape y dtype se
+          leen del engine/contexto (p.ej., segmentación 1xCxHxW o 1x1xHxW).
+
+    Parámetros
+    ----------
+    plan_path : str
+        Ruta al archivo TensorRT serializado (*.plan).
+
+    Retorna
+    -------
+    dict
+        Diccionario con los objetos necesarios para ejecutar inferencia:
+        - engine : trt.ICudaEngine
+            Engine deserializado. Contiene la red optimizada y la
+            descripción de I/O.
+        - ctx : trt.IExecutionContext
+            Contexto de ejecución asociado al engine. No es thread-safe.
+        - inp_name : str
+            Nombre del tensor de entrada (API de tensores).
+        - out_name : str
+            Nombre del tensor de salida principal.
+        - out_shape : tuple[int, ...]
+            Forma de la salida tal como la reporta el engine/contexto.
+            Se usa para dimensionar buffers host y post-procesar.
+        - out_dtype : numpy.dtype
+            Tipo de dato real de la salida (p.ej., np.float32, np.float16, np.int8).
+        - d_in : pycuda.driver.DeviceAllocation
+            Único buffer en device para la entrada. Tamaño: 1*3*IM_SIZE*IM_SIZE*4 bytes.
+        - d_out : pycuda.driver.DeviceAllocation
+            Único buffer en device para la salida. Tamaño = prod(out_shape) * sizeof(out_dtype).
+        - stream : pycuda.driver.Stream
+            Stream CUDA para copias async y ejecución (`execute_async_v3`).
+    """
     logger = trt.Logger(trt.Logger.WARNING)
     with open(plan_path, "rb") as f:
         engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
     ctx = engine.create_execution_context()
 
-    # Nombres de tensores (API de tensores)
-    inp_name = [n for n in engine if engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT][0]
-    out_name = [n for n in engine if engine.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT][0]
+    # Nombres I/O (API v3)
+    inp_name = next(n for n in engine if engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT)
+    out_name = next(n for n in engine if engine.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT)
 
-    # Shape fija de entrada (1,3,512,512)
-    in_shape = (1, 3, IM_SIZE, IM_SIZE)
-    if -1 in _dims_to_tuple(engine.get_tensor_shape(inp_name)):
-        ctx.set_input_shape(inp_name, in_shape)
+    # Suponemos entrada fija (1,3,IM_SIZE,IM_SIZE) → bytes de input conocidos
+    bytes_in = 1 * 3 * IM_SIZE * IM_SIZE * np.dtype(np.float32).itemsize
+    d_in = cuda.mem_alloc(bytes_in)
 
-    # Shape/dtype de salida (convierte Dims -> tupla)
-    out_shape = _dims_to_tuple(ctx.get_tensor_shape(out_name))  # esperado: (1, C, 512, 512)
+    # Para reservar la salida, leemos shape y dtype directo del engine/contexto
+    out_shape = tuple(int(engine.get_tensor_shape(out_name)[i]) for i in range(len(engine.get_tensor_shape(out_name))))
     out_dtype = trt.nptype(engine.get_tensor_dtype(out_name))
-    C = out_shape[1]
+    bytes_out = int(np.prod(out_shape)) * np.dtype(out_dtype).itemsize
+    d_out = cuda.mem_alloc(bytes_out)
 
-    # Buffers host paginados (pinned) - doble buffer
-    h_in  = [cuda.pagelocked_empty(in_shape,  dtype=np.float32),
-             cuda.pagelocked_empty(in_shape,  dtype=np.float32)]
-    h_out = [cuda.pagelocked_empty(out_shape, dtype=out_dtype),
-             cuda.pagelocked_empty(out_shape, dtype=out_dtype)]
-
-    # Buffers device - doble buffer
-    d_in  = [cuda.mem_alloc(int(np.prod(in_shape)  * np.dtype(np.float32).itemsize)) for _ in range(2)]
-    d_out = [cuda.mem_alloc(int(np.prod(out_shape) * np.dtype(out_dtype).itemsize))  for _ in range(2)]
-
-    # Stream CUDA
     stream = cuda.Stream()
 
     return {
-        "engine": engine, "ctx": ctx,
-        "inp_name": inp_name, "out_name": out_name,
-        "in_shape": in_shape, "out_shape": out_shape, "out_dtype": out_dtype, "C": C,
-        "h_in": h_in, "h_out": h_out, "d_in": d_in, "d_out": d_out,
+        "engine": engine,
+        "ctx": ctx,
+        "inp_name": inp_name,
+        "out_name": out_name,
+        "out_shape": out_shape,
+        "out_dtype": out_dtype,
+        "d_in": d_in,
+        "d_out": d_out,
         "stream": stream
     }
+
 
 # =========================
 # Main (video)
 # =========================
 if __name__ == "__main__":
-    cv2.setNumThreads(1)  # menos overhead en CPU
-    st = init_trt(MODEL_PLAN)
-
-    use_cv_cuda = False
-    gpu_ctx = None
+    cv2.setNumThreads(1)
+    st = load_engine_and_alloc(MODEL_PLAN)
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise SystemExit("No se pudo abrir la cámara.")
 
     print("Presiona 'q' para salir.")
-    t_last = time.perf_counter()
-    t0 = t_last
+    t0 = time.perf_counter()
     n_frames = 0
-    window_name = "TRT Seg (pipeline)"
+    window_name = "TRT Seg (simple)"
 
-    # Prefill primer frame en buffer 0
-    ok, frame = cap.read()
-    if not ok:
-        raise SystemExit("No se pudo leer el primer frame.")
-    
-    preprocess_bgr_cpu(frame, IM_SIZE, st["h_in"][0])
-
-    buf = 0  # doble buffer
     while True:
-        nxt = 1 - buf
-
-        # Captura + preprocesa siguiente frame en host pinned (nxt)
         ok, frame = cap.read()
         if not ok:
             break
-        
-        preprocess_bgr_cpu(frame, IM_SIZE, st["h_in"][nxt])
 
-        # Subir input actual
-        cuda.memcpy_htod_async(st["d_in"][buf], st["h_in"][buf], st["stream"])
+        # --- Preprocesa en CPU ---
+        x_host = preprocess_bgr_cpu(frame, IM_SIZE)               # (1,3,512,512) float32
+        y_host = np.empty(st["out_shape"], dtype=st["out_dtype"]) # buffer host salida
 
-        # Direcciones por nombre (API v3) con el buffer actual
-        st["ctx"].set_tensor_address(st["inp_name"], int(st["d_in"][buf]))
-        st["ctx"].set_tensor_address(st["out_name"], int(st["d_out"][buf]))
+        # --- Copias y ejecución (una sola stream, sin doble buffer) ---
+        cuda.memcpy_htod(st["d_in"], x_host)  # copia H->D
 
-        # Ejecutar
+        st["ctx"].set_tensor_address(st["inp_name"], int(st["d_in"]))
+        st["ctx"].set_tensor_address(st["out_name"], int(st["d_out"]))
         st["ctx"].execute_async_v3(stream_handle=st["stream"].handle)
 
-        # Bajar salida
-        cuda.memcpy_dtoh_async(st["h_out"][buf], st["d_out"][buf], st["stream"])
+        cuda.memcpy_dtoh_async(y_host, st["d_out"], st["stream"])  # D->H
         st["stream"].synchronize()
 
-        # Post-proceso
-        out_host = st["h_out"][buf]  # [1,C,512,512] o [1,1,512,512]
-        pred = out_host[0].argmax(axis=0).astype(np.uint8)   # [H,W]
+        # --- Post-proceso ---
+        # y_host: [1,C,H,W] o [1,1,H,W]
+        logits = y_host[0]  # [C,H,W] o [1,H,W]
+        if logits.ndim == 3 and logits.shape[0] > 1:
+            pred = logits.argmax(axis=0).astype(np.uint8)
+        else:
+            pred = (logits.squeeze() > 0.5).astype(np.uint8)
 
         overlay = overlay_mask(frame, colorize_mask(pred), alpha=0.5)
 
-        # FPS
+        # HUD (FPS)
         n_frames += 1
         t_now = time.perf_counter()
-        dt = t_now - t_last
-        t_last = t_now
-        fps_inst = (1.0 / dt) if dt > 0 else 0.0
         fps_avg = n_frames / (t_now - t0 + 1e-9)
-
-        # HUD
-        cv2.putText(overlay, f"FPS(inst):  {fps_inst:4.1f}",  (16, 32), 0, 0.6, (40,255,40), 2)
-        cv2.putText(overlay, f"FPS(avg):   {fps_avg:4.1f}",  (16, 60), 0, 0.5, (40,255,40), 1)
+        cv2.putText(overlay, f"FPS(avg): {fps_avg:4.1f}", (16, 32), 0, 0.7, (40,255,40), 2)
 
         if categories is not None:
             uniq = np.unique(pred)[:5]
             labels = [categories[c] if c < len(categories) else str(c) for c in uniq]
-            cv2.putText(overlay, f"Clases~: {', '.join(labels)}", (16, 100), 0, 0.5, (40,255,40), 1)
+            cv2.putText(overlay, f"Clases: {', '.join(labels)}", (16, 64), 0, 0.6, (40,255,40), 2)
 
         cv2.imshow(window_name, overlay)
         if (cv2.waitKey(1) & 0xFF) == ord('q'):
             break
-
-        # alternar buffer
-        buf = nxt
 
     cap.release()
     cv2.destroyAllWindows()
