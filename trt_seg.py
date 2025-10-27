@@ -54,69 +54,39 @@ def preprocess_bgr_cpu_into(frame_bgr, out_array, size=IM_SIZE):
 # TensorRT init (sin doble buffer)
 # =========================
 def load_engine_and_alloc(plan_path):
-    """
-    Carga un engine TensorRT desde un .plan, crea el contexto de ejecución y
-    reserva UNA vez la memoria de device para entrada y salida. Devuelve
-    los identificadores clave para ejecutar inferencia cuadro a cuadro
-    con copias simples H->D, ejecución async y D->H.
-
-    Suposiciones:
-        - La ENTRADA del modelo es fija y coincide con el preprocesado:
-          (1, 3, IM_SIZE, IM_SIZE) en float32.
-        - La SALIDA del modelo está definida en el plan; su shape y dtype se
-          leen del engine/contexto (p.ej., segmentación 1xCxHxW o 1x1xHxW).
-
-    Parámetros
-    ----------
-    plan_path : str
-        Ruta al archivo TensorRT serializado (*.plan).
-
-    Retorna
-    -------
-    dict
-        Diccionario con los objetos necesarios para ejecutar inferencia:
-        - engine : trt.ICudaEngine
-            Engine deserializado. Contiene la red optimizada y la
-            descripción de I/O.
-        - ctx : trt.IExecutionContext
-            Contexto de ejecución asociado al engine. No es thread-safe.
-        - inp_name : str
-            Nombre del tensor de entrada (API de tensores).
-        - out_name : str
-            Nombre del tensor de salida principal.
-        - out_shape : tuple[int, ...]
-            Forma de la salida tal como la reporta el engine/contexto.
-            Se usa para dimensionar buffers host y post-procesar.
-        - out_dtype : numpy.dtype
-            Tipo de dato real de la salida (p.ej., np.float32, np.float16, np.int8).
-        - d_in : pycuda.driver.DeviceAllocation
-            Único buffer en device para la entrada. Tamaño: 1*3*IM_SIZE*IM_SIZE*4 bytes.
-        - d_out : pycuda.driver.DeviceAllocation
-            Único buffer en device para la salida. Tamaño = prod(out_shape) * sizeof(out_dtype).
-        - stream : pycuda.driver.Stream
-            Stream CUDA para copias async y ejecución (`execute_async_v3`).
-    """
     logger = trt.Logger(trt.Logger.WARNING)
     with open(plan_path, "rb") as f:
         engine = trt.Runtime(logger).deserialize_cuda_engine(f.read())
+    if engine is None:
+        raise RuntimeError("No se pudo deserializar el engine.")
     ctx = engine.create_execution_context()
+    if ctx is None:
+        raise RuntimeError("No se pudo crear el ExecutionContext.")
 
     inp_name = next(n for n in engine if engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT)
     out_name = next(n for n in engine if engine.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT)
 
-    # Dtypes reales del engine (si el plan está en FP16, esto será float16)
+    # Dtypes reales del engine
     inp_dtype = trt.nptype(engine.get_tensor_dtype(inp_name))
     out_dtype = trt.nptype(engine.get_tensor_dtype(out_name))
 
-    # Entrada fija por diseño del preprocess
+    # Fijar shape de entrada SI ES DINÁMICO
     in_shape = (1, 3, IM_SIZE, IM_SIZE)
-    bytes_in = int(np.prod(in_shape)) * np.dtype(inp_dtype).itemsize
-    d_in = cuda.mem_alloc(bytes_in)
+    in_dims = engine.get_tensor_shape(inp_name)
+    if any(int(d) < 0 for d in [in_dims[i] for i in range(len(in_dims))]):
+        # Importante: fijar antes de consultar salida
+        ctx.set_input_shape(inp_name, in_shape)
 
-    # Salida desde el engine/contexto
-    out_dims = engine.get_tensor_shape(out_name)
+    # Ahora sí, tomar la salida desde el CONTEXTO (no desde el engine)
+    out_dims = ctx.get_tensor_shape(out_name)
     out_shape = tuple(int(out_dims[i]) for i in range(len(out_dims)))
+    if any(d <= 0 for d in out_shape):
+        raise RuntimeError(f"Shape de salida inválido: {out_shape}")
+
+    # Reservas device
+    bytes_in  = int(np.prod(in_shape))  * np.dtype(inp_dtype).itemsize
     bytes_out = int(np.prod(out_shape)) * np.dtype(out_dtype).itemsize
+    d_in  = cuda.mem_alloc(bytes_in)
     d_out = cuda.mem_alloc(bytes_out)
 
     stream = cuda.Stream()
@@ -127,7 +97,6 @@ def load_engine_and_alloc(plan_path):
         "inp_dtype": inp_dtype, "out_dtype": out_dtype,
         "d_in": d_in, "d_out": d_out, "stream": stream
     }
-
 
 # =========================
 # Main (video)
@@ -143,9 +112,6 @@ if __name__ == "__main__":
     # Reusar host arrays (1 vez)
     x_host = np.empty(st["in_shape"], dtype=st["inp_dtype"])     # input host (fp16)
     y_host = np.empty(st["out_shape"], dtype=st["out_dtype"])    # output host (fp16 si plan)
-    # “Pinnea” estas mismas memorias (no creas nuevas)
-    cuda.register_host_memory(x_host)
-    cuda.register_host_memory(y_host)
 
     t0, n_frames = time.perf_counter(), 0
     while True:
@@ -153,17 +119,15 @@ if __name__ == "__main__":
         if not ok:
             break
 
-        preprocess_bgr_cpu_into(frame, x_host, IM_SIZE)          # escribe dentro de x_host (contiguo)
+        preprocess_bgr_cpu_into(frame, x_host, IM_SIZE)          # escribe dentro de x_host
+        cuda.memcpy_htod_async(st["d_in"], x_host, st["stream"]) # H->D (async)
 
-        # H->D (async)
-        cuda.memcpy_htod_async(st["d_in"], x_host, st["stream"])
-
-        # Ejecuta
         st["ctx"].set_tensor_address(st["inp_name"], int(st["d_in"]))
         st["ctx"].set_tensor_address(st["out_name"], int(st["d_out"]))
-        st["ctx"].execute_async_v3(stream_handle=st["stream"].handle)
+        ok_exec = st["ctx"].execute_async_v3(stream_handle=st["stream"].handle)
+        if not ok_exec:
+            raise RuntimeError("execute_async_v3 devolvió False")
 
-        # D->H (async) y sincroniza sólo antes de usar y_host
         cuda.memcpy_dtoh_async(y_host, st["d_out"], st["stream"])
         st["stream"].synchronize()
 
