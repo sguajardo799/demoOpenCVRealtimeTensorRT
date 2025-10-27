@@ -36,22 +36,22 @@ def overlay_mask(bgr, mask_color, alpha=0.5):
     return cv2.addWeighted(bgr, 1.0 - alpha, mask_resized, alpha, 0.0)
 
 # =========================
-# Preprocesado CPU simple
+# Preprocesado CPU 
 # =========================
 def preprocess_bgr_cpu(frame_bgr, size=IM_SIZE):
-    #mean = np.asarray(IMAGENET_MEAN, dtype=np.float32)
-    #std  = np.asarray(IMAGENET_STD,  dtype=np.float32)
+    mean = np.asarray(IMAGENET_MEAN, dtype=np.float32)
+    std  = np.asarray(IMAGENET_STD,  dtype=np.float32)
 
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     rgb = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
-    #rgb = (rgb - mean) / std
+    rgb = (rgb - mean) / std
     chw = np.transpose(rgb, (2, 0, 1))  # (3,H,W)
     x = np.empty((1, 3, size, size), np.float32)    # contiguo
     x[0] = chw                                      # copia -> contiguo
     return x
 
 # =========================
-# TensorRT init (sin doble buffer)
+# TensorRT init 
 # =========================
 def load_engine_and_alloc(plan_path):
     logger = trt.Logger(trt.Logger.WARNING)
