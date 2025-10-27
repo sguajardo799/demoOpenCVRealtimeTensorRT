@@ -46,8 +46,9 @@ def preprocess_bgr_cpu(frame_bgr, size=IM_SIZE):
     rgb = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
     rgb = (rgb - mean) / std
     chw = np.transpose(rgb, (2, 0, 1))  # (3,H,W)
-    x = np.expand_dims(chw, axis=0).astype(np.float32)  # (1,3,H,W)
-    return x  # host numpy
+    x = np.empty((1, 3, size, size), np.float32)    # contiguo
+    x[0] = chw                                      # copia -> contiguo
+    return x
 
 # =========================
 # TensorRT init (sin doble buffer)
