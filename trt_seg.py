@@ -50,13 +50,6 @@ def preprocess_bgr_cpu(frame_bgr, size=IM_SIZE, out_nchw=None):
     x[0, ...] = chw
     return x
 
-def has_cv_cuda():
-    """Devuelve True solo si OpenCV fue compilado con CUDA y hay device disponible."""
-    try:
-        return hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0
-    except Exception:
-        return False
-
 def preprocess_bgr_gpu(frame_bgr, gpu_ctx, out_nchw):
     """Versión con OpenCV CUDA (si está disponible). Descarga y normaliza en host."""
     mean = np.asarray(IMAGENET_MEAN, dtype=np.float32)
@@ -130,15 +123,8 @@ if __name__ == "__main__":
     cv2.setNumThreads(1)  # menos overhead en CPU
     st = init_trt(MODEL_PLAN)
 
-    # Detección robusta: si OpenCV no tiene CUDA, forzamos CPU
-    use_cv_cuda = has_cv_cuda()
+    use_cv_cuda = False
     gpu_ctx = None
-    if use_cv_cuda:
-        try:
-            gpu_ctx = {"cv_stream": cv2.cuda.Stream()}
-        except Exception:
-            use_cv_cuda = False
-            gpu_ctx = None
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -147,7 +133,6 @@ if __name__ == "__main__":
     print("Presiona 'q' para salir.")
     t_last = time.perf_counter()
     t0 = t_last
-    fps_ema, alpha = 0.0, 0.10
     n_frames = 0
     window_name = "TRT Seg (pipeline)"
 
@@ -155,10 +140,8 @@ if __name__ == "__main__":
     ok, frame = cap.read()
     if not ok:
         raise SystemExit("No se pudo leer el primer frame.")
-    if use_cv_cuda:
-        preprocess_bgr_gpu(frame, gpu_ctx, st["h_in"][0])
-    else:
-        preprocess_bgr_cpu(frame, IM_SIZE, st["h_in"][0])
+    
+    preprocess_bgr_cpu(frame, IM_SIZE, st["h_in"][0])
 
     buf = 0  # doble buffer
     while True:
@@ -168,10 +151,8 @@ if __name__ == "__main__":
         ok, frame = cap.read()
         if not ok:
             break
-        if use_cv_cuda:
-            preprocess_bgr_gpu(frame, gpu_ctx, st["h_in"][nxt])
-        else:
-            preprocess_bgr_cpu(frame, IM_SIZE, st["h_in"][nxt])
+        
+        preprocess_bgr_cpu(frame, IM_SIZE, st["h_in"][nxt])
 
         # Subir input actual
         cuda.memcpy_htod_async(st["d_in"][buf], st["h_in"][buf], st["stream"])
@@ -189,10 +170,7 @@ if __name__ == "__main__":
 
         # Post-proceso
         out_host = st["h_out"][buf]  # [1,C,512,512] o [1,1,512,512]
-        if st["C"] > 1:
-            pred = out_host[0].argmax(axis=0).astype(np.uint8)   # [H,W]
-        else:
-            pred = (out_host[0, 0] > 0.5).astype(np.uint8)
+        pred = out_host[0].argmax(axis=0).astype(np.uint8)   # [H,W]
 
         overlay = overlay_mask(frame, colorize_mask(pred), alpha=0.5)
 
@@ -202,12 +180,10 @@ if __name__ == "__main__":
         dt = t_now - t_last
         t_last = t_now
         fps_inst = (1.0 / dt) if dt > 0 else 0.0
-        fps_ema = fps_ema * (1.0 - alpha) + fps_inst * alpha
         fps_avg = n_frames / (t_now - t0 + 1e-9)
 
         # HUD
         cv2.putText(overlay, f"FPS(inst):  {fps_inst:4.1f}",  (16, 32), 0, 0.6, (40,255,40), 2)
-        cv2.putText(overlay, f"FPS(smooth):{fps_ema:4.1f}",  (16, 60), 0, 0.5, (40,255,40), 1)
         cv2.putText(overlay, f"FPS(avg):   {fps_avg:4.1f}",  (16, 80), 0, 0.5, (40,255,40), 1)
 
         if categories is not None:
