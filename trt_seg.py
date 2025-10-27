@@ -50,25 +50,6 @@ def preprocess_bgr_cpu(frame_bgr, size=IM_SIZE, out_nchw=None):
     x[0, ...] = chw
     return x
 
-def preprocess_bgr_gpu(frame_bgr, gpu_ctx, out_nchw):
-    """Versión con OpenCV CUDA (si está disponible). Descarga y normaliza en host."""
-    mean = np.asarray(IMAGENET_MEAN, dtype=np.float32)
-    std  = np.asarray(IMAGENET_STD,  dtype=np.float32)
-
-    gmat = cv2.cuda_GpuMat()
-    gmat.upload(frame_bgr, stream=gpu_ctx["cv_stream"])
-    gmat = cv2.cuda.cvtColor(gmat, cv2.COLOR_BGR2RGB)
-    gmat = cv2.cuda.resize(gmat, (IM_SIZE, IM_SIZE), interpolation=cv2.INTER_LINEAR)
-    gmat = gmat.convertTo(cv2.CV_32F, stream=gpu_ctx["cv_stream"], scale=1.0/255.0)
-
-    tmp = gmat.download(stream=gpu_ctx["cv_stream"])
-    gpu_ctx["cv_stream"].waitForCompletion()
-
-    tmp = (tmp - mean) / std
-    chw = np.transpose(tmp, (2, 0, 1))
-    out_nchw[0, ...] = chw
-    return out_nchw
-
 # =========================
 # TensorRT init + buffers
 # =========================
@@ -184,7 +165,7 @@ if __name__ == "__main__":
 
         # HUD
         cv2.putText(overlay, f"FPS(inst):  {fps_inst:4.1f}",  (16, 32), 0, 0.6, (40,255,40), 2)
-        cv2.putText(overlay, f"FPS(avg):   {fps_avg:4.1f}",  (16, 80), 0, 0.5, (40,255,40), 1)
+        cv2.putText(overlay, f"FPS(avg):   {fps_avg:4.1f}",  (16, 60), 0, 0.5, (40,255,40), 1)
 
         if categories is not None:
             uniq = np.unique(pred)[:5]
